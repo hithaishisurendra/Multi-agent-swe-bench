@@ -96,7 +96,7 @@ SWE-bench-AGENT does not consume any gold-patch metadata.
 
 ### Resolution
 
-**1 of 174 resolved.** Every other system in the study (single-shot and agentic) resolved zero instances. The published Phase 1 baseline on SWE-bench-C is also 0%.
+**0 of 174 resolved.** Every system in the study (single-shot and agentic) resolved zero instances. The published Phase 1 baseline on SWE-bench-C is also 0%.
 
 ### What Blocks Resolution
 
