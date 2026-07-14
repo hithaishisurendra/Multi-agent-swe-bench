@@ -4,6 +4,8 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+.phase2_proposal_v2.pdf
+.Agentic_AI_Project_2_Phase2_SWE-BENCH_AGENT (1).pdf
 example_trace.py
 example_outputs/
 /repos/

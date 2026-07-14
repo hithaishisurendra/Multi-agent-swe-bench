@@ -1,10 +1,10 @@
-# SWE-bench-C Multi-Agent System
+# SWE-bench-C Multi-Agent Bug Fixer
 
-An evidence-routed multi-agent pipeline for automatically resolving C-language issues from the [SWE-bench-C](https://huggingface.co/datasets/xingyaoww/swe-bench-c) benchmark.
+Multi-agent pipeline for automated bug fixing on SWE-bench-C (C repositories: jq, redis, zstd). Single-shot LLMs fail on this benchmark because they cannot localize bugs without repository access. They generate syntactically valid patches with correct diff headers and hunk markers, but the context lines do not match the actual repository state at base commit. The patches are structurally convincing fiction. This system addresses that failure mode through graph-augmented retrieval and evidence-routed feedback loops.
 
----
+## Architecture
 
-## Architecture Overview
+![SWE-bench-C Multi-Agent Pipeline](swe%20architecture.png)
 
 ```
 Issue Text
@@ -42,348 +42,155 @@ Issue Text
                                 └── low_confidence ──────────────────────────────── Planner (replan)
 ```
 
-**Each failure is routed back to the single agent that can fix it** — no re-running the whole pipeline from scratch on every retry.
+### Agents
 
----
+**Planner**: Receives the issue text and produces a search strategy. Classifies the issue type (bug fix, feature request, refactor), extracts keywords, and generates priority functions for the Localizer. No repository access.
 
-## Project Status
+**Localizer**: Three-pass retrieval engine. Pass 1 is graph keyword search across function and file nodes. Pass 2 is grep for keyword density. Pass 3 expands via graph neighborhood (callers, callees, shared headers). Composite scoring produces a ranked context bundle with file contents and function snippets. Confidence below 0.4 triggers replan.
 
-### ✅ Person 1 — Graph Infrastructure (COMPLETE)
+**Diagnostician**: Reads localized source files and test metadata to identify the root cause. Produces a structured fix plan with affected lines, expected behavior, and test constraints. Does not generate code.
 
-> **Owner**: Person 1
-> **Tests**: 45/45 smoke tests passing (`scripts/test_graph.py`)
+**Patcher**: Generates a unified diff from the fix plan and real source file contents. Context lines are copied from actual files, not hallucinated. This is the critical difference from single-shot approaches.
 
-All graph infrastructure is built and ready for the other agents to consume.
+**Validator**: Runs git apply, then the repository build system (make/gcc for C), then FAIL_TO_PASS tests. Stops at first failure and returns typed error messages.
 
-| File | Description |
-|---|---|
-| `graph/model.py` | `DepGraph` data structure — nodes (file, function), edges (include, call, test), adjacency index |
-| `graph/builder.py` | tree-sitter C parser — extracts file nodes, function nodes, call edges, include edges, test links |
-| `graph/query.py` | Traversal API: `get_neighbors()`, `get_callers()`, `get_callees()`, `get_file_functions()`, `expand_hop()`, `get_test_files()` |
-| `graph/scoring.py` | `keyword_search()` (name/path weighted match), `evidence_subgraph()` (BFS from keyword seeds), `extract_keywords()` |
-| `graph/repo_checkout.py` | `ensure_repo_at_commit()` — clones and checks out a repo at its SWE-bench base commit |
-| `graph/__init__.py` | Public API exports |
-| `scripts/build_all_graphs.py` | Batch graph builder for all 179 SWE-bench-C instances |
+### Tree-Sitter Dependency Graph
 
-**⚠️ Action Required**: The `graphs/` directory is currently empty. Run `scripts/build_all_graphs.py` on a machine with the target repos cloned to populate it before running the pipeline end-to-end.
+Built offline before agents run. Parses C source files without requiring compilation. Nodes are files and functions (with line ranges). Edges are #include dependencies, function calls, type/struct usage, and test mappings. Stored in-memory as Python dictionaries. Construction takes seconds per repository.
 
----
+This graph enables structural retrieval. A fix in compress.c may require zstd_internal.h and compress_impl.c, neither of which mentions issue keywords. The graph captures these relationships explicitly.
 
-### ✅ Person 2 — Planner + Pipeline Orchestration (COMPLETE)
+## Evidence Routing
 
-> **Owner**: Person 2
-> **Tests**: 38/38 passing (`scripts/test_person2.py`)
+Each failure type routes back to the one agent that can fix it, capped at 2 retries per slot.
 
-The pipeline's shared communication contract, logging backbone, LLM planner, and orchestration controller are all implemented.
+| Failure Type   | Detected At | Routed To     | Action                                     |
+| -------------- | ----------- | ------------- | ------------------------------------------ |
+| apply_failed   | Validator   | Localizer     | Re-search with expanded graph neighborhood |
+| compile_failed | Validator   | Patcher       | Retry with compiler error message          |
+| test_failed    | Validator   | Diagnostician | Re-analyze with test output                |
+| regression     | Validator   | Diagnostician | Revise fix plan                            |
+| low_confidence | Localizer   | Planner       | Replan with alternative keywords           |
 
-#### Inter-Agent Schema (`pipeline/schema.py`)
-All typed messages that flow between agents — **the source of truth for Person 3/4/5**:
+No re-running the whole pipeline on every retry. A compilation error goes to the Patcher with the error message. A test failure goes to the Diagnostician with test output. An apply failure goes to the Localizer for better retrieval.
 
-| Dataclass | Direction | Fields |
-|---|---|---|
-| `SWEInstance` | Dataset → all agents | `instance_id`, `repo`, `base_commit`, `problem_statement`, `fail_to_pass`, `pass_to_pass` |
-| `PlannerOutput` | Planner → Localizer | `keywords`, `search_hints`, `suspected_modules`, `priority_functions`, `issue_type` |
-| `ContextBundle` | Localizer → Diagnostician | `candidates`, `confidence`, `file_contents`, `relevant_snippets`, `test_files` |
-| `FixPlan` | Diagnostician → Patcher | `root_cause`, `affected_files`, `affected_regions`, `test_constraints`, `fix_description` |
-| `PatchOutput` | Patcher → Validator | `unified_diff` (git-apply ready), `affected_files` |
-| `ValidationResult` | Validator → Controller | `status`, `resolved`, `apply_ok`, `compile_ok`, `tests_passed`, `tests_failed`, `error_output` |
-| `FeedbackMessage` | Controller → upstream agent | `failure_type`, `route_to`, `evidence`, `retry_number` |
-| `FailureType` | Enum | `SUCCESS`, `APPLY`, `COMPILE`, `TEST`, `REGRESSION`, `LOW_CONF` |
+## Results
 
-#### Structured Logger (`pipeline/logger.py`)
-- JSONL file per instance: `logs/<instance_id>_<timestamp>.jsonl`
-- Compact stdout echo: `[instance_id] [agent] event  key=val`
-- `PipelineLogger.load(path)` — static method to replay a run's events
+Evaluated on 174 instances from SWE-bench-C (jq: 45, redis: 90, zstd: 44).
 
-#### Planner Agent (`agents/planner.py`)
-- **LLM backend**: Voyager (OpenAI-compatible) running `qwen3-30b-a3b-instruct-2507`
-- Produces `PlannerOutput` with keywords, priority functions, suspected modules
-- **Two prompts**: initial plan (`plan()`) and low-confidence replan (`replan()`)
-- JSON output with brace-extraction + parse-failure retry (up to `max_llm_retries`)
-- Shared OpenAI client defined in `agents/llm.py`; Diagnostician and Patcher reuse it
+### Localization
 
-#### Pipeline Controller (`pipeline/controller.py`)
-- Sequences all 5 agents: Planner → Localizer → Diagnostician → Patcher → Validator
-- **Evidence routing table**: maps each `FailureType` to the specific agent that retries
-- Per-agent retry cap (`max_retries`, default 2)
-- Persists final `ValidationResult` to `results/<instance_id>.json`
-- Handles `LOW_CONF` → replan without re-running all downstream agents
+**22 of 174 instances** localized (gold-patch file recovered). Beats all three baselines:
 
-#### Agent Stubs (`agents/stubs.py`)
-Drop-in stubs for Persons 3/4/5 that implement the required method signatures. Used for end-to-end pipeline smoke testing before teammate code is ready.
+- V1 Qwen3 Blind: 5/174
+- V2 Qwen3 Enhanced: 17/174 (but this baseline consumed gold-patch metadata: file paths, affected functions, test names)
+- V3 GPT-4.1-mini: 1/174
 
-#### Config & CLI
-| File | Purpose |
-|---|---|
-| `config.py` | `Config.from_env()` — loads all settings from `.env` |
-| `run_pipeline.py` | CLI entry point with `--instance_id`, `--repo`, `--all`, `--planner-only`, `--stub-agents` |
-| `.env.example` | Template for API key setup |
+SWE-bench-AGENT does not consume any gold-patch metadata.
 
----
+### Compilation
 
-### ✅ Person 3 — Localizer + Retrieval Engine (COMPLETE)
+- jq subset: 9 patches compiled after localization
+- redis subset: 1 apply-clean patch (redis_redis-8580), the only system besides the metadata-fed baseline to apply anything on redis
+- zstd subset: 3 localized the correct file but failed git apply due to mismatched hunk context lines
 
-> **Owner**: Person 3
-> **Tests**: 50/50 passing (`scripts/test_person3.py`)
+### Resolution
 
-The Localizer is a three-pass retrieval engine — primarily deterministic (graph + grep), with optional LLM re-ranking for ablation experiments.
+**1 of 174 resolved.** Every other system in the study (single-shot and agentic) resolved zero instances. The published Phase 1 baseline on SWE-bench-C is also 0%.
 
-#### Three-Pass Retrieval Architecture
+### What Blocks Resolution
 
-```
-Pass 1: Graph keyword search
-    keyword_search(graph, keywords)  →  node scores → aggregated by file
-
-Pass 2: Grep pass
-    grep_repo(repo_root, keywords + priority_functions)  →  hit density per file
-
-Pass 3: Graph neighbourhood expansion
-    evidence_subgraph(graph, keywords, top_k=5, hops=2)
-    → BFS from top seeds → new files discovered via structural links
-
-→ Composite score = graph × 0.60 + grep × 0.30 + suspected_bonus × 0.10
-→ Read file contents + extract function snippets
-→ Confidence scoring → ContextBundle
-```
-
-#### Confidence Score (4-component)
-| Component | Weight | Meaning |
-|---|---|---|
-| `top_score_norm` | 0.40 | How strong is the top file's raw score? |
-| `score_gap` | 0.25 | How decisively does #1 beat #2? |
-| `coverage` | 0.15 | How many files did we find (vs desired 8)? |
-| `module_hit_rate` | 0.20 | Did Planner's suspected files appear in results? |
-
-If `confidence < threshold` (default 0.4), the Controller routes `LOW_CONF` back to the Planner for replanning.
-
-#### Files Implemented
-
-| File | Description |
-|---|---|
-| `agents/localizer.py` | Main `LocalizerAgent` — `localize()`, `localize_with_feedback()`, confidence scoring, optional LLM re-ranking |
-| `agents/tools/grep_tool.py` | Whole-word case-insensitive regex grep over `.c`/`.h` files; skips vendor dirs; returns `GrepHit` dataclasses |
-| `agents/tools/file_reader.py` | `read_file()`, `extract_snippet()` (with ±3 line context padding, 150-line cap), `extract_function_snippets()` using graph line metadata |
-| `agents/tools/graph_tools.py` | `build_scored_candidates()`, `select_top_function_nodes()` — bridges Person 1's graph API to scored candidate format |
-| `agents/tools/__init__.py` | Package exports |
-
-#### Feedback / Retry Mode
-When `apply_failed` is routed back, `localize_with_feedback()`:
-1. Parses the rejected file path from the Validator's error evidence (e.g., `error: patch failed: src/jv.c:145`)
-2. Expands the graph 1 hop from that seed (`min_confidence=0.7`)
-3. Re-runs the full three-pass retrieval with the expanded neighbourhood
-
----
-
-### ✅ Person 4 — Diagnostician + Patcher (COMPLETE)
-
-> **Owner**: Person 4
-> **Tests**: `scripts/test_person4.py`
-
-Both agents use the shared Voyager / Qwen3-30B client in `agents/llm.py`
-(OpenAI-compatible). Credentials come from `OPENAI_API_KEY` and
-`OPENAI_API_BASE` (default `https://openai.rc.asu.edu/v1`).
-
-| File | Role |
-|---|---|
-| `agents/diagnostician.py` | `DiagnosticianAgent.diagnose` / `.revise` — produces `FixPlan` with root cause, affected regions, and test constraints. |
-| `agents/patcher.py` | `PatcherAgent.patch` / `.patch_with_feedback` — emits a `git apply`-compatible unified diff. Context lines are copied from real file content in `ContextBundle.file_contents` (falls back to disk via `repo_root`). |
-
----
-
-### ✅ Person 5 — Validator (COMPLETE)
-
-> **Owner**: Person 5
-> **Tests**: `scripts/test_person5.py`
-
-| File | Role |
-|---|---|
-| `agents/validator.py` | `ValidatorAgent.validate` — runs `git apply` → `make` → FAIL_TO_PASS tests → PASS_TO_PASS regression check. Stops at first failure and returns the appropriate `FailureType` (`APPLY` / `COMPILE` / `TEST` / `REGRESSION`) so the controller can route evidence back to the responsible agent. |
-
-`repo_root` is set per-instance by `run_pipeline.py` via
-`ValidatorAgent.set_repo_root(...)`. Compile / test timeouts are driven by
-`COMPILE_TIMEOUT` and `TEST_TIMEOUT` env vars (see `config.py`).
-
----
-
-## Test Results Summary
-
-| Suite | Tests | Status |
-|---|---|---|
-| `scripts/test_graph.py` | 45 | ✅ All passing |
-| `scripts/test_person2.py` | 38 | ✅ All passing (live LLM: SKIP — quota, key is valid) |
-| `scripts/test_person3.py` | 50 | ✅ All passing (real-repo: SKIP — repos/ not cloned yet) |
-| `scripts/test_person4.py` | Diagnostician + Patcher | ✅ integration tests written |
-| `scripts/test_person5.py` | Validator | ✅ integration tests written |
-
----
+Hunk context lines must match the repository state exactly at base commit. A single character difference causes git apply to fail. Even when the Patcher has access to real source files, generating context that matches line-for-line remains the wall. This is the central open challenge for the benchmark.
 
 ## Quick Start
 
-### 1. Install dependencies
+### Install
 
 ```bash
 pip install tree-sitter tree-sitter-c openai python-dotenv
-# Optional for HuggingFace dataset auto-download:
-pip install datasets
 ```
 
-### 2. Set up environment
+### Environment
 
 ```bash
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY (Voyager key)
+# Edit .env and add your OPENAI_API_KEY (Voyager API key)
 ```
 
-### 3. Build graphs (Person 1 prerequisite)
+### Run
 
 ```bash
-# Clone repos first (example for jq):
-git clone https://github.com/jqlang/jq repos/jqlang__jq
-cd repos/jqlang__jq && git checkout <base_commit> && cd ../..
-
-# Build the graph for all instances:
-python scripts/build_all_graphs.py
-```
-
-### 4. Run tests
-
-```bash
-# No API key needed for Person 1 and 3 tests:
-python scripts/test_graph.py
-python -X utf8 scripts/test_person3.py
-
-# Needs OPENAI_API_KEY set in .env:
-python -X utf8 scripts/test_person2.py
-```
-
-### 5. Run the pipeline
-
-```bash
-# Smoke test with stubs (no repos or advanced agents needed):
-python run_pipeline.py --instance_id jq-493__jqlang__jq --stub-agents
-
-# Planner only (useful for testing Planner + Localizer together):
-python run_pipeline.py --instance_id jq-493__jqlang__jq --planner-only
-
-# Full pipeline:
+# Single instance
 python run_pipeline.py --instance_id jq-493__jqlang__jq
 
-# Run all jq instances:
+# All jq instances
 python run_pipeline.py --repo jqlang/jq
 
-# Run all 179 SWE-bench-C instances:
+# All 174 SWE-bench-C instances
 python run_pipeline.py --all
 ```
 
----
+Logs are written to `logs/<instance_id>.jsonl`. Final validation results are in `results/<instance_id>.json`.
 
-## File Tree
+## Repository Structure
 
 ```
 swe-bench-agent/
-│
-├── config.py                    # Environment-driven configuration
+├── config.py                    # Environment configuration
 ├── run_pipeline.py              # CLI entry point
 ├── .env.example                 # API key template
-├── .gitignore
 │
-├── graph/                       # ✅ Person 1 — Graph Infrastructure
-│   ├── __init__.py
+├── graph/                       # Tree-sitter dependency graph
 │   ├── model.py                 # DepGraph data structure
-│   ├── builder.py               # tree-sitter C parser & graph builder
-│   ├── query.py                 # Traversal API (expand_hop, get_callers, ...)
-│   ├── scoring.py               # keyword_search, evidence_subgraph
-│   └── repo_checkout.py         # ensure_repo_at_commit
+│   ├── builder.py               # C parser and graph builder
+│   ├── query.py                 # Traversal API (callers, callees, etc)
+│   ├── scoring.py               # Keyword search and evidence subgraph
+│   └── repo_checkout.py         # Clone and checkout at base commit
 │
-├── pipeline/                    # ✅ Person 2 — Schema, Logger, Controller
-│   ├── __init__.py
-│   ├── schema.py                # ALL inter-agent typed messages
-│   ├── logger.py                # JSONL structured event logger
-│   └── controller.py            # Orchestrator + evidence routing
+├── pipeline/                    # Orchestration
+│   ├── schema.py                # Inter-agent typed messages
+│   ├── logger.py                # JSONL event logger
+│   └── controller.py            # Evidence routing and retry logic
 │
 ├── agents/                      # Agents
-│   ├── __init__.py
-│   ├── planner.py               # ✅ Person 2 — Voyager/Qwen3-30B Planner
-│   ├── llm.py                   # Shared OpenAI-compatible client (Voyager)
-│   ├── localizer.py             # ✅ Person 3 — Three-pass retrieval engine
-│   ├── stubs.py                 # Stubs for smoke-testing (run_pipeline.py --stub-agents)
-│   ├── diagnostician.py         # ✅ Person 4 — DiagnosticianAgent
-│   ├── patcher.py               # ✅ Person 4 — PatcherAgent
-│   ├── validator.py             # ✅ Person 5 — ValidatorAgent
-│   └── tools/                   # ✅ Person 3 — Retrieval tools
-│       ├── __init__.py
-│       ├── grep_tool.py         # Regex grep over repo source files
-│       ├── file_reader.py       # File content + function snippet extraction
-│       └── graph_tools.py       # Scored file candidate builder
+│   ├── planner.py               # Issue classification and search strategy
+│   ├── localizer.py             # Three-pass retrieval engine
+│   ├── diagnostician.py         # Root cause analysis
+│   ├── patcher.py               # Unified diff generation
+│   ├── validator.py             # git apply → compile → test
+│   ├── llm.py                   # Shared OpenAI-compatible client
+│   ├── stubs.py                 # Agent stubs for smoke testing
+│   └── tools/                   # Localizer tools
+│       ├── grep_tool.py         # Whole-word regex grep
+│       ├── file_reader.py       # File reading and snippet extraction
+│       └── graph_tools.py       # Scored candidate builder
 │
 ├── scripts/
-│   ├── build_all_graphs.py      # Build & cache graphs for all instances
-│   ├── test_graph.py            # ✅ Person 1 smoke tests (45 tests)
-│   ├── test_person2.py          # ✅ Person 2 tests (38 tests)
-│   └── test_person3.py          # ✅ Person 3 tests (50 tests)
+│   ├── build_all_graphs.py      # Batch graph builder
+│   ├── test_graph.py            # Graph infrastructure tests
+│   ├── test_person2.py          # Planner and controller tests
+│   ├── test_person3.py          # Localizer tests
+│   ├── test_person4.py          # Diagnostician and Patcher tests
+│   └── test_person5.py          # Validator tests
 │
-├── graphs/                      # ⚠️  EMPTY — run build_all_graphs.py
-├── repos/                       # ⚠️  EMPTY — clone target repos here
-└── results/                     # Pipeline output (auto-created)
+├── graphs/                      # Pre-built graph JSON files
+├── repos/                       # Cloned repository checkouts
+├── results/                     # Final validation results
+└── logs/                        # Per-instance JSONL logs
 ```
-
----
-
-## Integration Guide for Persons 4 & 5
-
-### What you receive (ContextBundle from Localizer)
-
-```python
-bundle = ContextBundle(
-    instance_id = "jq-493__jqlang__jq",
-    candidates  = [
-        LocalizerCandidate(
-            file_path  = "src/jv.c",
-            score      = 0.87,            # composite relevance score
-            reason     = "graph_score=4.2; grep_hits=12; suspected_by_planner",
-            functions  = ["src/jv.c::jv_parse", "src/jv.c::jv_load"],
-        ),
-        ...                               # up to 8 candidates, ranked
-    ],
-    confidence      = 0.74,              # > 0.4 means Planner agrees
-    file_contents   = {
-        "src/jv.c": "<full source text of the file>",
-        ...
-    },
-    relevant_snippets = {
-        "src/jv.c::jv_parse": "// --- 142-158 ---\nint jv_parse(...) { ... }",
-        ...
-    },
-    test_files = ["tests/jq.test", "tests/jq_test.c"],
-)
-```
-
-### What you must produce (FixPlan → PatchOutput → ValidationResult)
-
-See `pipeline/schema.py` for the full field definitions.  The stubs in
-`agents/stubs.py` show the exact method signatures your classes must implement.
-
-### Running integration tests while implementing
-
-```bash
-# Test with real Localizer, stub Patcher/Validator:
-python run_pipeline.py --instance_id jq-493__jqlang__jq --stub-agents
-```
-
----
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENAI_API_KEY` | *required* | Voyager API key (ASU) |
-| `OPENAI_API_BASE` | `https://openai.rc.asu.edu/v1` | Voyager base URL |
-| `MODEL_NAME` | `qwen3-30b-a3b-instruct-2507` | Model for Planner / Diagnostician / Patcher |
-| `CONF_THRESHOLD` | `0.4` | Localizer confidence below this → replan |
-| `MAX_RETRIES` | `2` | Max retries per agent slot on failure |
-| `COMPILE_TIMEOUT` | `300` | Validator: `make` timeout (seconds) |
-| `TEST_TIMEOUT` | `120` | Validator: per-test timeout (seconds) |
-| `LOG_DIR` | `logs/` | JSONL log output directory |
-| `GRAPHS_DIR` | `graphs/` | Pre-built graph JSON files |
-| `REPOS_DIR` | `repos/` | Cloned repository checkouts |
-| `RESULTS_DIR` | `results/` | Final ValidationResult JSON files |
+| Variable          | Default                        | Description                                     |
+| ----------------- | ------------------------------ | ----------------------------------------------- |
+| `OPENAI_API_KEY`  | required                       | Voyager API key                                 |
+| `OPENAI_API_BASE` | `https://openai.rc.asu.edu/v1` | Voyager base URL                                |
+| `MODEL_NAME`      | `qwen3-30b-a3b-instruct-2507`  | Model for Planner/Diagnostician/Patcher         |
+| `CONF_THRESHOLD`  | `0.4`                          | Localizer confidence below this triggers replan |
+| `MAX_RETRIES`     | `2`                            | Max retries per agent slot                      |
+| `COMPILE_TIMEOUT` | `300`                          | Validator make timeout (seconds)                |
+| `TEST_TIMEOUT`    | `120`                          | Validator per-test timeout (seconds)            |
+| `LOG_DIR`         | `logs/`                        | JSONL log output directory                      |
+| `GRAPHS_DIR`      | `graphs/`                      | Pre-built graph JSON files                      |
+| `REPOS_DIR`       | `repos/`                       | Cloned repository checkouts                     |
+| `RESULTS_DIR`     | `results/`                     | Final ValidationResult JSON files               |
