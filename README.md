@@ -447,9 +447,9 @@ swe-bench-agent/
 
 **SWE-bench-C measures repository-level reasoning**, not code generation. Progressive evaluation shows:
 
-- **Localization**: 5 → 22 instances (+340%) ✅ **Phase 1 bottleneck solved**
-- **Compilation**: 5 → 9 instances (+80%) ✅ **Partial progress**
-- **Resolution**: 0 → 0 ❌ **Frontier challenge for all systems**
+- **Localization**: 5 → 22 instances (+340%) **Phase 1 bottleneck solved**
+- **Compilation**: 5 → 9 instances (+80%) **Partial progress**
+- **Resolution**: 0 → 0 **Frontier challenge for all systems**
 
 The **apply-to-resolve gap** is the benchmark's intended difficulty. No system (including metadata-augmented baselines) has solved it.
 
