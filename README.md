@@ -162,10 +162,10 @@ Each agent gets **exactly the information needed** to fix its failure mode. Max 
 
 | System | Localization | Uses Metadata? | Improvement |
 |--------|--------------|----------------|-------------|
-| V1: Qwen3 Blind | 5/174 (2.9%) | ❌ No | — |
-| V2: Qwen3 Enhanced | 17/174 (9.8%) | ✅ Yes (file paths, functions in prompt) | — |
-| V3: GPT-4.1-mini | 1/174 (0.6%) | ❌ No | — |
-| **SWE-bench-AGENT** | **22/174 (12.6%)** | ❌ **No** | **+340% vs. V1** |
+| V1: Qwen3 Blind | 5/174 (2.9%) | No | — |
+| V2: Qwen3 Enhanced | 17/174 (9.8%) | Yes (file paths, functions in prompt) | — |
+| V3: GPT-4.1-mini | 1/174 (0.6%) | No | — |
+| **SWE-bench-AGENT** | **22/174 (12.6%)** | **No** | **+340% vs. V1** |
 
 **Key**: Beat even the metadata-augmented baseline (22 vs. 17) through graph-based retrieval.
 
@@ -273,8 +273,8 @@ Generates diff with **real context lines** (not hallucinated):
 ```
 
 **5. Validator**
-- ✅ `git apply` success (context matched exactly)
-- ❌ `make` failure (macOS `stat64` declaration issue—environment-specific)
+- `git apply` success (context matched exactly)
+- `make` failure (macOS `stat64` declaration issue—environment-specific)
 
 **Result**: Apply success, compile failure (environment), 0 resolution.
 
@@ -284,13 +284,13 @@ Generates diff with **real context lines** (not hallucinated):
 
 ## What Worked vs. What Didn't
 
-### ✅ Solved
+### Solved
 
 1. **Localization** (12.6% vs. 0.6-2.9%): Tree-sitter graphs + 3-pass retrieval
 2. **Context Accuracy** (40% exact match vs. 0%): Real source access in Patcher
 3. **Efficient Retries** (60% cost reduction): Evidence routing to specific agents
 
-### ❌ Unsolved
+### Unsolved
 
 1. **Hunk Context Matching** (60% apply failures): Byte-for-byte matching still hard
 2. **Cross-File Patches** (20% of bugs): Single-file diffs insufficient
